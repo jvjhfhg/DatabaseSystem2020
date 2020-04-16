@@ -17,6 +17,23 @@ import java.util.concurrent.ConcurrentHashMap;
  * @Threadsafe, all fields are final
  */
 public class BufferPool {
+    private static class PageIdWithTime implements Comparable<PageIdWithTime> {
+        public long t;
+        public PageId pid;
+
+        public PageIdWithTime(long t, PageId pid) {
+            this.t = t;
+            this.pid = pid;
+        }
+
+        public int compareTo(PageIdWithTime oth) {
+            if (t != oth.t) {
+                return (int) (t - oth.t);
+            }
+            return pid.hashCode() - oth.pid.hashCode();
+        }
+    }
+
     /** Bytes per page, including header. */
     private static final int PAGE_SIZE = 4096;
 
@@ -28,6 +45,8 @@ public class BufferPool {
     public static final int DEFAULT_PAGES = 50;
 
     private Map<PageId, Page> pageBuffer;
+    private TreeSet<PageIdWithTime> pageIdWithTimes;
+    private Map<PageId, Long> lastOptTime;
     private int capacity;
 
     /**
@@ -37,6 +56,8 @@ public class BufferPool {
      */
     public BufferPool(int numPages) {
         pageBuffer = new HashMap<>();
+        pageIdWithTimes = new TreeSet<>();
+        lastOptTime = new HashMap<>();
         capacity = numPages;
     }
     
@@ -52,6 +73,60 @@ public class BufferPool {
     // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
     public static void resetPageSize() {
     	BufferPool.pageSize = PAGE_SIZE;
+    }
+
+    /**
+     * Update the lastOptTime for given page ID.
+     *
+     * @param pid the ID of the requested page
+     * @param t the new lastOptTime (in millisecond)
+     */
+    private void updateLastOptTime(PageId pid, long t) {
+        long oldT = lastOptTime.get(pid);
+        pageIdWithTimes.remove(new PageIdWithTime(oldT, pid));
+
+        lastOptTime.replace(pid, t);
+        pageIdWithTimes.add(new PageIdWithTime(t, pid));
+    }
+
+    /**
+     * Update the lastOptTime for given page ID to current time.
+     *
+     * @param pid the ID of the requested page
+     */
+    private void updateLastOptTime(PageId pid) {
+        updateLastOptTime(pid, Calendar.getInstance().getTimeInMillis());
+    }
+
+    /**
+     * Add a page to buffer pool at time t.
+     * @param page instance of the added page
+     * @param t the time (in millisecond) the adding operation occurs
+     */
+    private void addPage(Page page, long t) throws DbException {
+        PageId pid = page.getId();
+
+        if (pageBuffer.containsKey(pid)) {
+            pageBuffer.replace(pid, page);
+            updateLastOptTime(pid, t);
+            return;
+        }
+
+        if (pageBuffer.size() == capacity) {
+            evictPage();
+        }
+
+        pageBuffer.put(pid, page);
+        pageIdWithTimes.add(new PageIdWithTime(t, pid));
+        lastOptTime.put(pid, t);
+    }
+
+    /**
+     * Add a page to buffer pool.
+     * @param page instance of the added page
+     */
+    private void addPage(Page page) throws DbException {
+        addPage(page, Calendar.getInstance().getTimeInMillis());
     }
 
     /**
@@ -71,17 +146,18 @@ public class BufferPool {
      */
     public Page getPage(TransactionId tid, PageId pid, Permissions perm)
                 throws TransactionAbortedException, DbException {
-        if (pageBuffer.containsKey(pid)) {
-            return pageBuffer.get(pid);
-        }
-        if (pageBuffer.size() == capacity) {
-            // TODO: To be implemented in later lab
-            throw new DbException("BufferPool is full (Eviction policy is not implemented). ");
-        } else {
-            Page page = Database.getCatalog().getDatabaseFile(pid.getTableId()).readPage(pid);
-            pageBuffer.put(pid, page);
+        Page page = pageBuffer.get(pid);
+
+        if (page != null) {
+            updateLastOptTime(pid);
             return page;
         }
+
+        Page newPage = Database.getCatalog().getDatabaseFile(pid.getTableId()).readPage(pid);
+
+        addPage(newPage);
+
+        return newPage;
     }
 
     /**
@@ -93,7 +169,7 @@ public class BufferPool {
      * @param tid the ID of the transaction requesting the unlock
      * @param pid the ID of the page to unlock
      */
-    public  void releasePage(TransactionId tid, PageId pid) {
+    public void releasePage(TransactionId tid, PageId pid) {
         // some code goes here
         // not necessary for lab1|lab2
     }
@@ -144,9 +220,12 @@ public class BufferPool {
      * @param t the tuple to add
      */
     public void insertTuple(TransactionId tid, int tableId, Tuple t)
-        throws DbException, IOException, TransactionAbortedException {
-        // some code goes here
-        // not necessary for lab1
+                throws DbException, IOException, TransactionAbortedException {
+        ArrayList<Page> pagesModified = Database.getCatalog().getDatabaseFile(tableId).insertTuple(tid, t);
+        for (Page page : pagesModified) {
+            page.markDirty(true, tid);
+            addPage(page);
+        }
     }
 
     /**
@@ -162,10 +241,13 @@ public class BufferPool {
      * @param tid the transaction deleting the tuple.
      * @param t the tuple to delete
      */
-    public  void deleteTuple(TransactionId tid, Tuple t)
-        throws DbException, IOException, TransactionAbortedException {
-        // some code goes here
-        // not necessary for lab1
+    public void deleteTuple(TransactionId tid, Tuple t)
+                throws DbException, IOException, TransactionAbortedException {
+        ArrayList<Page> pagesModified = Database.getCatalog().getDatabaseFile(t.getRecordId().getPageId().getTableId()).deleteTuple(tid, t);
+        for (Page page : pagesModified) {
+            page.markDirty(true, tid);
+            addPage(page);
+        }
     }
 
     /**
@@ -174,36 +256,51 @@ public class BufferPool {
      *     break simpledb if running in NO STEAL mode.
      */
     public synchronized void flushAllPages() throws IOException {
-        // some code goes here
-        // not necessary for lab1
-
+        for (PageId pid : pageBuffer.keySet()) {
+            flushPage(pid);
+        }
     }
 
-    /** Remove the specific page id from the buffer pool.
-        Needed by the recovery manager to ensure that the
-        buffer pool doesn't keep a rolled back page in its
-        cache.
-        
-        Also used by B+ tree files to ensure that deleted pages
-        are removed from the cache so they can be reused safely
-    */
+    /**
+     * Remove the specific page id from the buffer pool.
+     *  Needed by the recovery manager to ensure that the
+     *  buffer pool doesn't keep a rolled back page in its
+     *  cache.
+     *
+     *  Also used by B+ tree files to ensure that deleted pages
+     *  are removed from the cache so they can be reused safely
+     */
     public synchronized void discardPage(PageId pid) {
-        // some code goes here
-        // not necessary for lab1
+        Page page = pageBuffer.get(pid);
+        if (page != null) {
+            try {
+                flushPage(pid);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            long t = lastOptTime.get(pid);
+            pageBuffer.remove(pid);
+            pageIdWithTimes.remove(new PageIdWithTime(t, pid));
+            lastOptTime.remove(pid);
+        }
     }
 
     /**
      * Flushes a certain page to disk
      * @param pid an ID indicating the page to flush
      */
-    private synchronized  void flushPage(PageId pid) throws IOException {
-        // some code goes here
-        // not necessary for lab1
+    private synchronized void flushPage(PageId pid) throws IOException {
+        Page page = pageBuffer.get(pid);
+        if (page != null && page.isDirty() != null) {
+            Database.getCatalog().getDatabaseFile(pid.getTableId()).writePage(page);
+            page.markDirty(false, null);
+        }
     }
 
     /** Write all pages of the specified transaction to disk.
      */
-    public synchronized  void flushPages(TransactionId tid) throws IOException {
+    public synchronized void flushPages(TransactionId tid) throws IOException {
         // some code goes here
         // not necessary for lab1|lab2
     }
@@ -212,9 +309,14 @@ public class BufferPool {
      * Discards a page from the buffer pool.
      * Flushes the page to disk to ensure dirty pages are updated on disk.
      */
-    private synchronized  void evictPage() throws DbException {
-        // some code goes here
-        // not necessary for lab1
+    private synchronized void evictPage() throws DbException {
+        if (pageBuffer.isEmpty()) {
+            throw new DbException("Unable to evict page: Buffer pool is empty. ");
+        }
+
+        PageId pid = pageIdWithTimes.first().pid;
+
+        discardPage(pid);
     }
 
 }
