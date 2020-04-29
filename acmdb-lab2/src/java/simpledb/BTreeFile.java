@@ -799,7 +799,7 @@ public class BTreeFile implements DbFile {
 		}
 
 		BTreeEntry newEntry = new BTreeEntry(key, backPid, rightSibling.iterator().next().getRightChild());
-		newEntry.setRecordId(rightSibling.iterator().next().getRecordId());
+		newEntry.setRecordId(page.reverseIterator().next().getRecordId());
 		parent.insertEntry(newEntry);
 
 		updateParentPointers(tid, dirtypages, parent);
