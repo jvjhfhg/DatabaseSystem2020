@@ -106,7 +106,6 @@ public class HeapFile implements DbFile {
 
             if (page.getNumEmptySlots() > 0) {
                 page.insertTuple(t);
-                page.markDirty(true, tid);
                 dirtyPages.add(page);
                 return dirtyPages;
             }
@@ -124,8 +123,7 @@ public class HeapFile implements DbFile {
                 throws DbException, TransactionAbortedException {
         ArrayList<Page> dirtyPages = new ArrayList<>();
         HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, t.getRecordId().getPageId(), Permissions.READ_WRITE);
-        page.deleteTuple(t);;
-        page.markDirty(true, tid);
+        page.deleteTuple(t);
         dirtyPages.add(page);
         return dirtyPages;
     }
