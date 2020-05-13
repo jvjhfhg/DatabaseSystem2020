@@ -1,11 +1,26 @@
 package simpledb;
 
+import sun.reflect.generics.reflectiveObjects.NotImplementedException;
+
+import java.util.HashMap;
+
 /**
  * Knows how to compute some aggregate over a set of StringFields.
  */
 public class StringAggregator implements Aggregator {
 
     private static final long serialVersionUID = 1L;
+
+    private int groupByField;
+    private Type groupByFieldType;
+    private int aggregateField;
+    private Op op;
+
+    private TupleDesc tupleDesc;
+
+    private HashMap<Field, Integer> cnt;
+
+    private HashMap<Field, Tuple> ans;
 
     /**
      * Aggregate constructor
@@ -17,15 +32,58 @@ public class StringAggregator implements Aggregator {
      */
 
     public StringAggregator(int gbfield, Type gbfieldtype, int afield, Op what) {
-        // some code goes here
+        this.groupByField = gbfield;
+        this.groupByFieldType = gbfieldtype;
+        this.aggregateField = afield;
+        this.op = what;
+
+        cnt = new HashMap<>();
+
+        if (groupByField == NO_GROUPING) {
+            tupleDesc = new TupleDesc(new Type[] {Type.INT_TYPE});
+        } else {
+            tupleDesc = new TupleDesc(new Type[] {gbfieldtype, Type.INT_TYPE});
+        }
+
+        ans = new HashMap<>();
     }
 
     /**
      * Merge a new tuple into the aggregate, grouping as indicated in the constructor
-     * @param tup the Tuple containing an aggregate field and a group-by field
+     * @param tuple the Tuple containing an aggregate field and a group-by field
      */
-    public void mergeTupleIntoGroup(Tuple tup) {
-        // some code goes here
+    public void mergeTupleIntoGroup(Tuple tuple) {
+        Field key = null;
+        if (groupByField != NO_GROUPING) {
+            key = tuple.getField(groupByField);
+        }
+        String value = ((StringField) tuple.getField(aggregateField)).getValue();
+
+        if (!cnt.containsKey(key)) {
+            cnt.put(key, 1);
+        } else {
+            cnt.put(key, cnt.get(key) + 1);
+        }
+
+        Tuple resTuple = new Tuple(tupleDesc);
+        IntField ansField = null;
+
+        switch (op) {
+            case COUNT:
+                ansField = new IntField(cnt.get(key));
+                break;
+            default:
+                throw new NotImplementedException();
+        }
+
+        if (groupByField == NO_GROUPING) {
+            resTuple.setField(0, ansField);
+        } else {
+            resTuple.setField(0, key);
+            resTuple.setField(1, ansField);
+        }
+
+        ans.put(key, resTuple);
     }
 
     /**
@@ -37,8 +95,7 @@ public class StringAggregator implements Aggregator {
      *   aggregate specified in the constructor.
      */
     public DbIterator iterator() {
-        // some code goes here
-        throw new UnsupportedOperationException("please implement me for lab3");
+        return new TupleIterator(tupleDesc, ans.values());
     }
 
 }
