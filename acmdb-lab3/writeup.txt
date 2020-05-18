@@ -1,9 +1,7 @@
-Writeup for Lab2 - Zhiqi Zhang, 517030910426
+Writeup for Lab3 - Zhiqi Zhang, 517030910426
 
-I record the last operating time of each page in BufferPool and evict the earliest one. 
+In HeapFile.insertTuple(), when all the current pages are full and a new page is needed, I wrote an empty page to the file and inserted the tuple into the newed Page instance at first. The new page would be returned to BufferPool.insertTuple() and be inserted into BufferPool since I thought I could't directly call the insertTuple() method in DbFile. But in test/HeapFileWirteTest.addTuple(), the test directly called HeapFile.insertTuple() causing the first tuple of new page was not inserted into the page. 
 
-I implement Tuple.equals() since I've heard some of my classmates failed the system test of BTreeFileInsertTest because of the not implemented Tuple.equals() during our communicating, while none of them have new-ed a Tuple. 
+I found Operator.getChildren() and Operator.setChildren() methods useless and easy to cause problems since the iterators passed in or out may not be at initial status. 
 
-I feel confused with the description of IndexPredicate.equals() since I think it's nothing related to equals() and do not know how to use it in my project. 
-
-And it costs me 2-3 days to complete this lab. 
+I spent about 2 days on this lab. 
