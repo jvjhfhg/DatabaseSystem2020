@@ -7,8 +7,8 @@ import simpledb.TupleDesc.TDItem;
 
 public class QueryPlanVisualizer {
 
-    static final String JOIN = "⨝";
-    static final String HASH_JOIN = "⨝(hash)";
+    static final String JOIN = "|X|";
+    static final String HASH_JOIN = "|X|(hash)";
     static final String SELECT = "σ";
     static final String PROJECT = "π";
     static final String RENAME = "ρ";
