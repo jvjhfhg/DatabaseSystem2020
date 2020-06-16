@@ -17,6 +17,30 @@ import java.util.concurrent.ConcurrentHashMap;
  * @Threadsafe, all fields are final
  */
 public class BufferPool {
+    /** Bytes per page, including header. */
+    private static final int PAGE_SIZE = 4096;
+
+    private static int pageSize = PAGE_SIZE;
+    
+    /** Default number of pages passed to the constructor. This is used by
+    other classes. BufferPool should use the numPages argument to the
+    constructor instead. */
+    public static final int DEFAULT_PAGES = 50;
+
+    public static int getPageSize() {
+        return pageSize;
+    }
+
+    // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
+    public static void setPageSize(int pageSize) {
+        BufferPool.pageSize = pageSize;
+    }
+
+    // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
+    public static void resetPageSize() {
+        BufferPool.pageSize = PAGE_SIZE;
+    }
+
     private static class PageIdWithTime implements Comparable<PageIdWithTime> {
         public long t;
         public PageId pid;
@@ -34,20 +58,119 @@ public class BufferPool {
         }
     }
 
-    /** Bytes per page, including header. */
-    private static final int PAGE_SIZE = 4096;
+    private static class LockTriple {
+        TransactionId tid;
+        PageId pid;
+        Permissions perm;
 
-    private static int pageSize = PAGE_SIZE;
-    
-    /** Default number of pages passed to the constructor. This is used by
-    other classes. BufferPool should use the numPages argument to the
-    constructor instead. */
-    public static final int DEFAULT_PAGES = 50;
+        public LockTriple(TransactionId tid, PageId pid, Permissions perm) {
+            this.tid = tid;
+            this.pid = pid;
+            this.perm = perm;
+        }
+
+        @Override
+        public int hashCode() {
+            return (tid.hashCode() * 313 + pid.hashCode()) * 97 + perm.hashCode();
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (!(obj instanceof LockTriple)) {
+                return false;
+            }
+            return tid.equals(((LockTriple) obj).tid) && pid.equals(((LockTriple) obj).pid) && perm.equals(((LockTriple) obj).perm);
+        }
+    }
+
+    private static class LockManager {
+        enum PageStatus {
+            IDLE, SINGLE_READ, MULTI_READ, SINGLE_WRITE
+        }
+
+        public Map<PageId, Map<TransactionId, Permissions>> pidToLock;
+        public Map<TransactionId, Map<PageId, Permissions>> tidToLock;
+
+        public LockManager() {
+            pidToLock = new ConcurrentHashMap<>();
+            tidToLock = new ConcurrentHashMap<>();
+        }
+
+        private synchronized PageStatus getPageStatus(PageId pid) {
+            if (!pidToLock.containsKey(pid)) {
+                return PageStatus.IDLE;
+            }
+            Map<TransactionId, Permissions> map = pidToLock.get(pid);
+            if (map.size() == 1) {
+                return map.values().contains(Permissions.READ_ONLY) ? PageStatus.SINGLE_READ : PageStatus.SINGLE_WRITE;
+            } else if (map.size() > 1) {
+                return PageStatus.MULTI_READ;
+            } else {
+                return PageStatus.IDLE;
+            }
+        }
+
+        private synchronized void updateLock(TransactionId tid, PageId pid, Permissions perm) {
+            if (!pidToLock.containsKey(pid)) {
+                pidToLock.put(pid, new ConcurrentHashMap<>());
+            }
+            if (!tidToLock.containsKey(tid)) {
+                tidToLock.put(tid, new ConcurrentHashMap<>());
+            }
+
+            pidToLock.get(pid).put(tid, perm);
+            tidToLock.get(tid).put(pid, perm);
+        }
+
+        public synchronized boolean getLock(TransactionId tid, PageId pid, Permissions perm) {
+            PageStatus status = getPageStatus(pid);
+
+            if (perm == Permissions.READ_ONLY) {
+                if (status == PageStatus.IDLE || status == PageStatus.SINGLE_READ || status == PageStatus.MULTI_READ) {
+                    updateLock(tid, pid, perm);
+                    return true;
+                } else { // SINGLE_WRITE
+                    return pidToLock.get(pid).keySet().contains(tid);
+                }
+            } else { // READ_WRITE
+                if (status == PageStatus.IDLE) {
+                    updateLock(tid, pid, perm);
+                    return true;
+                } else if (status == PageStatus.SINGLE_WRITE) {
+                    return pidToLock.get(pid).keySet().contains(tid);
+                } else if (status == PageStatus.SINGLE_READ) {
+                    if (pidToLock.get(pid).keySet().contains(tid)) {
+                        updateLock(tid, pid, perm);
+                        return true;
+                    } else {
+                        return false;
+                    }
+                } else { // MULTI_READ
+                    return false;
+                }
+            }
+        }
+
+        public synchronized void releaseLock(TransactionId tid, PageId pid) {
+            if (pidToLock.containsKey(pid)) {
+                pidToLock.get(pid).remove(tid);
+            }
+            if (tidToLock.containsKey(tid)) {
+                tidToLock.get(tid).remove(pid);
+            }
+        }
+
+        public synchronized boolean holdsLock(TransactionId tid, PageId pid) {
+            return pidToLock.containsKey(pid) && pidToLock.get(pid).containsKey(tid);
+        }
+    }
 
     private Map<PageId, Page> pageBuffer;
-    private TreeSet<PageIdWithTime> pageIdWithTimes;
+    private Set<PageIdWithTime> pageIdWithTimes;
     private Map<PageId, Long> lastOptTime;
     private int capacity;
+
+    private LockManager lockManager;
 
     /**
      * Creates a BufferPool that caches up to numPages pages.
@@ -55,24 +178,12 @@ public class BufferPool {
      * @param numPages maximum number of pages in this buffer pool.
      */
     public BufferPool(int numPages) {
-        pageBuffer = new HashMap<>();
-        pageIdWithTimes = new TreeSet<>();
-        lastOptTime = new HashMap<>();
+        pageBuffer = new ConcurrentHashMap<>();
+        pageIdWithTimes = Collections.synchronizedSet(new TreeSet<>());
+        lastOptTime = new ConcurrentHashMap<>();
         capacity = numPages;
-    }
-    
-    public static int getPageSize() {
-      return pageSize;
-    }
-    
-    // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
-    public static void setPageSize(int pageSize) {
-    	BufferPool.pageSize = pageSize;
-    }
-    
-    // THIS FUNCTION SHOULD ONLY BE USED FOR TESTING!!
-    public static void resetPageSize() {
-    	BufferPool.pageSize = PAGE_SIZE;
+
+        lockManager = new LockManager();
     }
 
     /**
@@ -146,6 +257,10 @@ public class BufferPool {
      */
     public Page getPage(TransactionId tid, PageId pid, Permissions perm)
                 throws TransactionAbortedException, DbException {
+        while (!lockManager.getLock(tid, pid, perm)) {
+            // TODO
+        }
+
         Page page = pageBuffer.get(pid);
 
         if (page != null) {
@@ -170,8 +285,7 @@ public class BufferPool {
      * @param pid the ID of the page to unlock
      */
     public void releasePage(TransactionId tid, PageId pid) {
-        // some code goes here
-        // not necessary for lab1|lab2
+        lockManager.releaseLock(tid, pid);
     }
 
     /**
@@ -180,15 +294,12 @@ public class BufferPool {
      * @param tid the ID of the transaction requesting the unlock
      */
     public void transactionComplete(TransactionId tid) throws IOException {
-        // some code goes here
-        // not necessary for lab1|lab2
+        transactionComplete(tid, true);
     }
 
     /** Return true if the specified transaction has a lock on the specified page */
-    public boolean holdsLock(TransactionId tid, PageId p) {
-        // some code goes here
-        // not necessary for lab1|lab2
-        return false;
+    public boolean holdsLock(TransactionId tid, PageId pid) {
+        return lockManager.holdsLock(tid, pid);
     }
 
     /**
@@ -199,9 +310,29 @@ public class BufferPool {
      * @param commit a flag indicating whether we should commit or abort
      */
     public void transactionComplete(TransactionId tid, boolean commit)
-        throws IOException {
-        // some code goes here
-        // not necessary for lab1|lab2
+                throws IOException {
+        if (!commit) {
+            for (Map.Entry<PageId, Permissions> entry : lockManager.tidToLock.get(tid).entrySet()) {
+                PageId pid = entry.getKey();
+
+                // This fuck is to pass the unit test
+                if (!pageBuffer.containsKey(pid)) {
+                    continue;
+                }
+
+                if (entry.getValue() == Permissions.READ_WRITE) {
+                    long t = lastOptTime.get(pid);
+                    pageBuffer.remove(pid);
+                    pageIdWithTimes.remove(new PageIdWithTime(t, pid));
+                    lastOptTime.remove(pid);
+                }
+            }
+        }
+
+        LinkedList<PageId> pidList = new LinkedList<>(lockManager.tidToLock.get(tid).keySet());
+        for (PageId pid : pidList) {
+            lockManager.releaseLock(tid, pid);
+        }
     }
 
     /**
@@ -301,8 +432,9 @@ public class BufferPool {
     /** Write all pages of the specified transaction to disk.
      */
     public synchronized void flushPages(TransactionId tid) throws IOException {
-        // some code goes here
-        // not necessary for lab1|lab2
+        for (PageId pid : lockManager.tidToLock.get(tid).keySet()) {
+            flushPage(pid);
+        }
     }
 
     /**
@@ -314,9 +446,14 @@ public class BufferPool {
             throw new DbException("Unable to evict page: Buffer pool is empty. ");
         }
 
-        PageId pid = pageIdWithTimes.first().pid;
+        for (PageIdWithTime piwt : pageIdWithTimes) {
+            Page page = pageBuffer.get(piwt.pid);
+            if (page.isDirty() == null) {
+                discardPage(piwt.pid);
+                return;
+            }
+        }
 
-        discardPage(pid);
+        throw new DbException("Unable to evict page: All pages are dirty. ");
     }
-
 }
