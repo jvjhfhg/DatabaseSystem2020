@@ -122,7 +122,7 @@ public class BufferPool {
             tidToLock.get(tid).put(pid, perm);
         }
 
-        public synchronized boolean getLock(TransactionId tid, PageId pid, Permissions perm) {
+        private synchronized boolean innerGetLock(TransactionId tid, PageId pid, Permissions perm) {
             PageStatus status = getPageStatus(pid);
 
             if (perm == Permissions.READ_ONLY) {
@@ -151,6 +151,15 @@ public class BufferPool {
             }
         }
 
+        public synchronized boolean getLock(TransactionId tid, PageId pid, Permissions perm, DeadlockChecker deadlockChecker) {
+            if (innerGetLock(tid, pid, perm)) {
+                deadlockChecker.addRequest(tid, pid);
+                return true;
+            } else {
+                return false;
+            }
+        }
+
         public synchronized void releaseLock(TransactionId tid, PageId pid) {
             if (pidToLock.containsKey(pid)) {
                 pidToLock.get(pid).remove(tid);
@@ -165,12 +174,71 @@ public class BufferPool {
         }
     }
 
+    private static class DeadlockChecker {
+        private Map<TransactionId, Set<PageId>> pageRequests;
+
+        public DeadlockChecker(LockManager lockManager) {
+            pageRequests = new ConcurrentHashMap<>();
+        }
+
+        public synchronized void addRequest(TransactionId tid, PageId pid) {
+            if (!pageRequests.containsKey(tid)) {
+                pageRequests.put(tid, new HashSet<>());
+            }
+            pageRequests.get(tid).add(pid);
+        }
+
+        public synchronized void removeRequest(TransactionId tid, PageId pid) {
+            if (pageRequests.containsKey(tid)) {
+                pageRequests.get(tid).remove(pid);
+            }
+        }
+
+        public synchronized boolean checkDeadlock(TransactionId tid, PageId pid, LockManager lockManager) {
+            Set<TransactionId> visitedTid = new HashSet<>();
+            Set<PageId> visitedPid = new HashSet<>();
+
+            Queue<Object> queue = new LinkedList<>();
+            queue.offer(pid);
+            while (!queue.isEmpty()) {
+                Object first = queue.poll();
+                if (first instanceof TransactionId) {
+                    TransactionId now = (TransactionId) first;
+                    if (pageRequests.containsKey(now)) {
+                        for (PageId to : pageRequests.get(now)) {
+                            if (!visitedPid.contains(to)) {
+                                queue.offer(to);
+                                visitedPid.add(to);
+                            }
+                        }
+                    }
+                } else { // first instanceof PageId
+                    PageId now = (PageId) first;
+                    if (lockManager.pidToLock.containsKey(now)) {
+                        for (TransactionId to : lockManager.pidToLock.get(now).keySet()) {
+                            if (to.equals(tid)) {
+                                return true;
+                            }
+                            if (!visitedTid.contains(to)) {
+                                queue.offer(to);
+                                visitedTid.add(to);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+    }
+
     private Map<PageId, Page> pageBuffer;
     private Set<PageIdWithTime> pageIdWithTimes;
     private Map<PageId, Long> lastOptTime;
     private int capacity;
 
-    private LockManager lockManager;
+    private final LockManager lockManager;
+    private final DeadlockChecker deadlockChecker;
 
     /**
      * Creates a BufferPool that caches up to numPages pages.
@@ -184,6 +252,7 @@ public class BufferPool {
         capacity = numPages;
 
         lockManager = new LockManager();
+        deadlockChecker = new DeadlockChecker(lockManager);
     }
 
     /**
@@ -192,9 +261,11 @@ public class BufferPool {
      * @param pid the ID of the requested page
      * @param t the new lastOptTime (in millisecond)
      */
-    private void updateLastOptTime(PageId pid, long t) {
-        long oldT = lastOptTime.get(pid);
-        pageIdWithTimes.remove(new PageIdWithTime(oldT, pid));
+    private synchronized void updateLastOptTime(PageId pid, long t) {
+        if (lastOptTime.containsKey(pid)) {
+            long oldT = lastOptTime.get(pid);
+            pageIdWithTimes.remove(new PageIdWithTime(oldT, pid));
+        }
 
         lastOptTime.replace(pid, t);
         pageIdWithTimes.add(new PageIdWithTime(t, pid));
@@ -205,7 +276,7 @@ public class BufferPool {
      *
      * @param pid the ID of the requested page
      */
-    private void updateLastOptTime(PageId pid) {
+    private synchronized void updateLastOptTime(PageId pid) {
         updateLastOptTime(pid, Calendar.getInstance().getTimeInMillis());
     }
 
@@ -214,7 +285,7 @@ public class BufferPool {
      * @param page instance of the added page
      * @param t the time (in millisecond) the adding operation occurs
      */
-    private void addPage(Page page, long t) throws DbException {
+    private synchronized void addPage(Page page, long t) throws DbException {
         PageId pid = page.getId();
 
         if (pageBuffer.containsKey(pid)) {
@@ -236,7 +307,7 @@ public class BufferPool {
      * Add a page to buffer pool.
      * @param page instance of the added page
      */
-    private void addPage(Page page) throws DbException {
+    private synchronized void addPage(Page page) throws DbException {
         addPage(page, Calendar.getInstance().getTimeInMillis());
     }
 
@@ -257,19 +328,13 @@ public class BufferPool {
      */
     public Page getPage(TransactionId tid, PageId pid, Permissions perm)
                 throws TransactionAbortedException, DbException {
-        int waitedTime = 0;
-        while (!lockManager.getLock(tid, pid, perm)) {
-            /* Random random = new Random();
-            int nextWating = 100 + random.nextInt(100);
-            try {
-                wait(nextWating);
-                waitedTime += nextWating;
-                if (waitedTime > 800) {
+        while (!lockManager.getLock(tid, pid, perm, deadlockChecker)) {
+            synchronized (lockManager) {
+                if (deadlockChecker.checkDeadlock(tid, pid, lockManager)) {
                     throw new TransactionAbortedException();
                 }
-            } catch (InterruptedException e) {
-
-            } */
+                deadlockChecker.addRequest(tid, pid);
+            }
         }
 
         Page page = pageBuffer.get(pid);
@@ -295,7 +360,7 @@ public class BufferPool {
      * @param tid the ID of the transaction requesting the unlock
      * @param pid the ID of the page to unlock
      */
-    public void releasePage(TransactionId tid, PageId pid) {
+    public synchronized void releasePage(TransactionId tid, PageId pid) {
         lockManager.releaseLock(tid, pid);
     }
 
@@ -309,7 +374,7 @@ public class BufferPool {
     }
 
     /** Return true if the specified transaction has a lock on the specified page */
-    public boolean holdsLock(TransactionId tid, PageId pid) {
+    public synchronized boolean holdsLock(TransactionId tid, PageId pid) {
         return lockManager.holdsLock(tid, pid);
     }
 
@@ -320,12 +385,12 @@ public class BufferPool {
      * @param tid the ID of the transaction requesting the unlock
      * @param commit a flag indicating whether we should commit or abort
      */
-    public void transactionComplete(TransactionId tid, boolean commit)
+    public synchronized void transactionComplete(TransactionId tid, boolean commit)
                 throws IOException {
         if (commit) {
             // And this one as well
             flushPages(tid);
-        } else {
+        } else if (lockManager.tidToLock.containsKey(tid)) {
             for (Map.Entry<PageId, Permissions> entry : lockManager.tidToLock.get(tid).entrySet()) {
                 PageId pid = entry.getKey();
 
@@ -343,9 +408,11 @@ public class BufferPool {
             }
         }
 
-        LinkedList<PageId> pidList = new LinkedList<>(lockManager.tidToLock.get(tid).keySet());
-        for (PageId pid : pidList) {
-            lockManager.releaseLock(tid, pid);
+        if (lockManager.tidToLock.containsKey(tid)) {
+            LinkedList<PageId> pidList = new LinkedList<>(lockManager.tidToLock.get(tid).keySet());
+            for (PageId pid : pidList) {
+                lockManager.releaseLock(tid, pid);
+            }
         }
     }
 
@@ -364,7 +431,7 @@ public class BufferPool {
      * @param tableId the table to add the tuple to
      * @param t the tuple to add
      */
-    public void insertTuple(TransactionId tid, int tableId, Tuple t)
+    public synchronized void insertTuple(TransactionId tid, int tableId, Tuple t)
                 throws DbException, IOException, TransactionAbortedException {
         ArrayList<Page> pagesModified = Database.getCatalog().getDatabaseFile(tableId).insertTuple(tid, t);
         for (Page page : pagesModified) {
@@ -386,7 +453,7 @@ public class BufferPool {
      * @param tid the transaction deleting the tuple.
      * @param t the tuple to delete
      */
-    public void deleteTuple(TransactionId tid, Tuple t)
+    public synchronized void deleteTuple(TransactionId tid, Tuple t)
                 throws DbException, IOException, TransactionAbortedException {
         ArrayList<Page> pagesModified = Database.getCatalog().getDatabaseFile(t.getRecordId().getPageId().getTableId()).deleteTuple(tid, t);
         for (Page page : pagesModified) {
@@ -446,8 +513,10 @@ public class BufferPool {
     /** Write all pages of the specified transaction to disk.
      */
     public synchronized void flushPages(TransactionId tid) throws IOException {
-        for (PageId pid : lockManager.tidToLock.get(tid).keySet()) {
-            flushPage(pid);
+        if (lockManager.tidToLock.containsKey(tid)) {
+            for (PageId pid : lockManager.tidToLock.get(tid).keySet()) {
+                flushPage(pid);
+            }
         }
     }
 
