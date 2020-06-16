@@ -257,8 +257,19 @@ public class BufferPool {
      */
     public Page getPage(TransactionId tid, PageId pid, Permissions perm)
                 throws TransactionAbortedException, DbException {
+        int waitedTime = 0;
         while (!lockManager.getLock(tid, pid, perm)) {
-            // TODO
+            /* Random random = new Random();
+            int nextWating = 100 + random.nextInt(100);
+            try {
+                wait(nextWating);
+                waitedTime += nextWating;
+                if (waitedTime > 800) {
+                    throw new TransactionAbortedException();
+                }
+            } catch (InterruptedException e) {
+
+            } */
         }
 
         Page page = pageBuffer.get(pid);
@@ -311,7 +322,10 @@ public class BufferPool {
      */
     public void transactionComplete(TransactionId tid, boolean commit)
                 throws IOException {
-        if (!commit) {
+        if (commit) {
+            // And this one as well
+            flushPages(tid);
+        } else {
             for (Map.Entry<PageId, Permissions> entry : lockManager.tidToLock.get(tid).entrySet()) {
                 PageId pid = entry.getKey();
 
