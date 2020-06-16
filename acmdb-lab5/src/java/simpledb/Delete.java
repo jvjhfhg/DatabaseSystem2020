@@ -69,8 +69,8 @@ public class Delete extends Operator {
             try {
                 ++cnt;
                 Database.getBufferPool().deleteTuple(tid, tuple);
-            } catch (Exception e) {
-                throw new DbException("");
+            } catch (IOException e) {
+                throw new DbException(e.getMessage());
             }
         }
 
